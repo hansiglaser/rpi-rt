@@ -43,6 +43,7 @@
 #include <linux/gpio.h>
 #include <linux/device.h>
 #include <linux/err.h>
+#include <asm/div64.h>
 
 //////////////////////////////////////////////////////////////////////////////
 // Configuration /////////////////////////////////////////////////////////////
@@ -52,8 +53,7 @@
 // GPIO 4 = physical pin 7, see e.g., http://pinout.xyz/pinout/pin7_gpio4
 #define GPIO_LATTEST_TOGGLE 4
 
-#define HIST_BIN_NUM  20  // number of histogram bins
-#define HIST_BIN_LSBS 10  // 2^LSBS ns width of each bin
+#define HIST_BIN_MAX  256  // maximum number of histogram bins
 
 //////////////////////////////////////////////////////////////////////////////
 // Variables /////////////////////////////////////////////////////////////////
@@ -63,17 +63,66 @@
 static volatile int gpio_lattest_value;   // same type as used for gpio_set_value()
 #endif // GPIO_LATTEST_TOGGLE
 
-static unsigned long period_ms;   // period of the hrtimer
-static struct hrtimer my_hrtimer; // hrtimer information structure
-static volatile int runcount;     // number of timer occurences to run, is set >0 and decremented, -1 denotes infinite runs
-static long long last_now_ns;     // last value of "now" in ns, is set to 0 to denote the first timer run
+static volatile unsigned long period_ms;   // period of the hrtimer
+static struct hrtimer my_hrtimer;          // hrtimer information structure
+static volatile int runcount;              // number of timer occurences to run, is set >0 and decremented, -1 denotes infinite runs
+static volatile long long last_now_ns;     // last value of "now" in ns, is set to 0 to denote the first timer run
 
 // statistics
-// TODO: mean value, stddev
-// histogram
-static unsigned int histogram[HIST_BIN_NUM];
-static long long hist_min = LLONG_MAX;
-static long long hist_max = LLONG_MIN;
+static volatile long long hist_bin_num;    // config: number of used bins (<= HIST_BIN_MAX)
+static volatile long long hist_bin_width;  // config: width of bins in ns
+static volatile long long stat_min;
+static volatile long long stat_max;
+static volatile long long stat_num;
+static volatile long long stat_sum;
+static volatile long long stat_sumsq;
+static volatile unsigned int histogram[HIST_BIN_MAX];
+
+/*
+hist_bin_num:
+ - even number: ..., n/2-1 = -xxx..-1, n/2 = 0..xxx, ...
+ - odd  number: bin around 0
+
+Find lower bound for bin:
+-------------------------
+e.g., hist_bin_num = 20, hist_bin_width = 1000
+0: -10000..-9001, 1: -9000..-8001, .., 8: -2000..-1001, 9: -1000..-1, 10: 0..999, 11: 1000..1999, 12: 2000..2999, ..., 19: 9000..10000
+lower bound: (i-10)*1000
+general: (i-(hist_bin_num>>1)*hist_bin_width
+
+e.g., hist_bin_num = 19, hist_bin_width = 1000
+0: -9500..-8499, ..., 8: -1500..-501, 9: -500..499, 10: 500..1499, 11: 1500..2499, ..., 18: 8500..9499
+lower bound: 500+(i-10)*1000
+general: (hist_bin_width>>1)+(i-((hist_bin_num+1)>>1)*hist_bin_width
+
+general: lower bound = (hist_bin_width>>1)*(hist_bin_num&1)+(i-((hist_bin_num+1)>>1)*hist_bin_width
+
+Find bin for value:
+-------------------
+(diff_ns - hist_bin_lower(0))/hist_bin_width
+*/
+
+#define HIST_BIN_LOW(i) ((hist_bin_width>>1)*(hist_bin_num&1)+((i)-((hist_bin_num+1)>>1))*hist_bin_width)
+
+//////////////////////////////////////////////////////////////////////////////
+// Helper Functions //////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////
+
+/**
+ * Divide 64 bit by 64 bit
+ *
+ * In the Linux kernel, we can't use the inline division with '/', see
+ *   http://stackoverflow.com/questions/25623956/aeabi-ldivmod-undefined-when-compiling-kernel-module
+ *
+ * Attention: do_div actually is uint64 / uint32!
+ */
+long long div_ll(long long n, long long base) {
+  long long a = abs(n);
+  long long b = abs(base);
+  do_div(a, b);   // quotient in a, returns the remainder, but it is unused here
+  if ((n < 0) ^ (base < 0)) a = -a;
+  return a;
+}
 
 //////////////////////////////////////////////////////////////////////////////
 // Timer Function ////////////////////////////////////////////////////////////
@@ -96,23 +145,29 @@ static enum hrtimer_restart lattest_timer_function(struct hrtimer *timer) {
   tjnow       = jiffies;
   now_kt      = hrtimer_cb_get_time(&my_hrtimer);
   now_ns      = ktime_to_ns(now_kt);
-  last_now_ns = now_ns;
   period_kt   = ktime_set(0, period_ms*1000000);
   ret_overrun = hrtimer_forward(&my_hrtimer, now_kt, period_kt);
   if (last_now_ns != 0) {
     diff_ns     = now_ns - last_now_ns;
 //    printk(KERN_INFO " lattest jiffies %lu ; ret: %d ; ktnsec: %lld = +%ldms %+lldns\n",
-//      tjnow, ret_overrun, now_kt_ns, period_ms, diff_ns - period_ns);
+//      tjnow, ret_overrun, now_ns, period_ms, diff_ns - period_ms*1000000);
     // statistics
     diff_ns = diff_ns - period_ms*1000000;   // reuse variable
-    // e.g., 0..1023 --> 10, 1024..2047 --> 11
-    hist_bin = (diff_ns >> HIST_BIN_LSBS) + (HIST_BIN_NUM >> 1);
+
+    if (diff_ns < stat_min) stat_min = diff_ns;
+    if (diff_ns > stat_max) stat_max = diff_ns;
+    stat_num++;
+    stat_sum   += diff_ns;
+    stat_sumsq += diff_ns*diff_ns;
+
+    // e.g., -1000..-1 --> 9, 0..999 --> 10, 1000..2000 --> 11
+    // no 64/64 bit division built in: hist_bin = (diff_ns - HIST_BIN_LOW(0)) / hist_bin_width;
+    hist_bin = div_ll(diff_ns - HIST_BIN_LOW(0), hist_bin_width);
     if (hist_bin < 0) hist_bin = 0;
-    if (hist_bin > HIST_BIN_NUM-1) hist_bin = HIST_BIN_NUM-1;
+    if (hist_bin >= hist_bin_num) hist_bin = hist_bin_num-1;
     histogram[hist_bin]++;
-    if (diff_ns < hist_min) hist_min = diff_ns;
-    if (diff_ns > hist_max) hist_max = diff_ns;
   }
+  last_now_ns = now_ns;
 
   if (runcount > 0) {
     // decrement counter
@@ -207,7 +262,12 @@ static ssize_t store_control_cb(struct device *dev, struct device_attribute *att
   // prepare for timer
   last_now_ns = 0;   // to denote the first run
   // reset statistics
-  // TODO
+  stat_min   = LLONG_MAX;
+  stat_max   = LLONG_MIN;
+  stat_num   = 0;
+  stat_sum   = 0;
+  stat_sumsq = 0;
+  memset((void*)histogram, 0, sizeof(histogram[0])*HIST_BIN_MAX);
 
   // start timer
   period_kt = ktime_set(0, period_ms*1000000);
@@ -236,7 +296,31 @@ static ssize_t store_config_cb(struct device *dev, struct device_attribute *attr
  * Query statistics: min, max, mean, stddev, histogram
  */
 static ssize_t show_statistics_cb(struct device *dev, struct device_attribute *attr, char *buf) {
-  return 0;
+  ssize_t count = 0;
+  int len;
+  long long stat_mean;
+  int i;
+
+  // precalculate values
+  if (stat_num > 0) {
+    stat_mean = div_ll(stat_sum, stat_num);   // replacing inline 64/64bit division
+  } else {
+    stat_mean = 0;
+  }
+  // report histogram (we can't use the FPU in a kernel module :-( )
+  len = scnprintf(&(buf[count]), PAGE_SIZE-count, "Min: %+lldns\n", stat_min); count += len;
+  len = scnprintf(&(buf[count]), PAGE_SIZE-count, "Max: %+lldns\n", stat_max); count += len;
+  len = scnprintf(&(buf[count]), PAGE_SIZE-count, "Num: %lld\n", stat_num); count += len;
+  len = scnprintf(&(buf[count]), PAGE_SIZE-count, "Sum: %+lldns\n", stat_sum); count += len;
+  len = scnprintf(&(buf[count]), PAGE_SIZE-count, "Mean: ~%+lldns\n", stat_mean); count += len;
+  len = scnprintf(&(buf[count]), PAGE_SIZE-count, "SqSum: %lldns\n", stat_sumsq); count += len;
+  // histogram
+  len = scnprintf(&(buf[count]), PAGE_SIZE-count, " <  %+6lldns: %d\n", HIST_BIN_LOW(1), histogram[0]); count += len;
+  for (i = 1; i < hist_bin_num; i++) {
+    len = scnprintf(&(buf[count]), PAGE_SIZE-count, " >= %+6lldns: %d\n", HIST_BIN_LOW(i), histogram[i]); count += len;
+    if (count > PAGE_SIZE) return PAGE_SIZE;
+  }
+  return count;
 }
 
 static struct class  *s_pDeviceClass;
@@ -285,9 +369,10 @@ static int __init lattest_init(void) {
   printk(KERN_INFO "  Registered sysfs attributes at /sys/class/LatTest/LatTest/\n");
 
   // set defaults
-  runcount = 0;
-  period_ms = 10;
-  // TODO
+  runcount       = 0;     // 0: stopped
+  period_ms      = 10;    // ms
+  hist_bin_num   = 20;
+  hist_bin_width = 1000;  // ns
 
   // timer
   hrtimer_init(&my_hrtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
@@ -299,8 +384,7 @@ static int __init lattest_init(void) {
 
 static void __exit lattest_exit(void) {
   int ret_cancel = 0;
-  int i;
-  while( hrtimer_callback_running(&my_hrtimer) ) {
+  while (hrtimer_callback_running(&my_hrtimer)) {
     ret_cancel++;
   }
   if (ret_cancel != 0) {
@@ -329,13 +413,6 @@ static void __exit lattest_exit(void) {
   device_destroy(s_pDeviceClass, 0);
   class_destroy(s_pDeviceClass);
 
-  // report histogram
-  printk(KERN_INFO "Min: %+lldns\n", hist_min);
-  printk(KERN_INFO " <  %+6dns: %d\n", (1-HIST_BIN_LSBS) << HIST_BIN_LSBS, histogram[0]);
-  for (i = 1; i < HIST_BIN_NUM; i++) {
-    printk(KERN_INFO " >= %+6dns: %d\n", (i-HIST_BIN_LSBS) << HIST_BIN_LSBS, histogram[i]);
-  }
-  printk(KERN_INFO "Max: %+lldns\n", hist_max);
   printk(KERN_INFO "Exit lattest\n");
 }
 

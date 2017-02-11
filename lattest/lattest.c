@@ -216,7 +216,7 @@ static ssize_t show_period_cb(struct device *dev, struct device_attribute *attr,
  */
 static ssize_t store_period_cb(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
   unsigned int new_period;
-  if (runcount != 0) return -EINVAL;   // timer already running
+  if (runcount != 0) return -EINVAL;   // timer running
 
   if (kstrtouint(buf, 10, &new_period) < 0) return -EINVAL;
   // max. 1 second allowed
@@ -280,14 +280,16 @@ static ssize_t store_control_cb(struct device *dev, struct device_attribute *att
  * Query statistics configuration
  */
 static ssize_t show_config_cb(struct device *dev, struct device_attribute *attr, char *buf) {
-  return 0;
+  return scnprintf(buf, PAGE_SIZE, "Histogram bin width: %lld\nHistogram bin count: %lld\n", hist_bin_width, hist_bin_num);
 }
 
 /**
  * Configure statistics: number and width of histogram bins
  */
 static ssize_t store_config_cb(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
-  if (runcount != 0) return -EINVAL;   // timer already running
+  if (runcount != 0) return -EINVAL;   // timer running
+
+  // TODO: implement
 
   return 0;
 }

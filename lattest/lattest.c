@@ -356,12 +356,14 @@ static ssize_t show_statistics_cb(struct device *dev, struct device_attribute *a
   // precalculate values
   if (stat_num > 0) {
     stat_mean = div_ll(stat_sum, stat_num);   // replacing inline 64/64bit division
+    // StdDev = sqrt((stat_sumsq-(stat_sum^2)/stat_num)/stat_num)
+    stat_var = div_ll(stat_sumsq - div_ll(stat_sum*stat_sum, stat_num), stat_num);
+    stat_stddev = isqrtu64(stat_var);
   } else {
     stat_mean = 0;
+    stat_var = 0;
+    stat_stddev = 0;
   }
-  // StdDev = sqrt((stat_sumsq-(stat_sum^2)/stat_num)/stat_num)
-  stat_var = div_ll(stat_sumsq - div_ll(stat_sum*stat_sum, stat_num), stat_num);
-  stat_stddev = isqrtu64(stat_var);
   // report histogram (we can't use the FPU in a kernel module :-( )
   len = scnprintf(&(buf[count]), PAGE_SIZE-count, "Min: %+lldns\n", stat_min); count += len;
   len = scnprintf(&(buf[count]), PAGE_SIZE-count, "Max: %+lldns\n", stat_max); count += len;

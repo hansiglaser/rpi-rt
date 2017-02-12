@@ -124,6 +124,54 @@ long long div_ll(long long n, long long base) {
   return a;
 }
 
+// taken from
+// http://stackoverflow.com/questions/1100090/looking-for-an-efficient-integer-square-root-algorithm-for-arm-thumb2
+// and changed to 64 bit
+/**
+ * \brief    Fast Square root algorithm, with rounding
+ *
+ * This does arithmetic rounding of the result. That is, if the real answer
+ * would have a fractional part of 0.5 or greater, the result is rounded up to
+ * the next integer.
+ *      - SquareRootRounded(2) --> 1
+ *      - SquareRootRounded(3) --> 2
+ *      - SquareRootRounded(4) --> 2
+ *      - SquareRootRounded(6) --> 2
+ *      - SquareRootRounded(7) --> 3
+ *      - SquareRootRounded(8) --> 3
+ *      - SquareRootRounded(9) --> 3
+ *
+ * \param[in] a_nInput - unsigned integer for which to find the square root
+ *
+ * \return Integer square root of the input value.
+ */
+uint64_t isqrtu64(uint64_t a_nInput) {
+  uint64_t op  = a_nInput;
+  uint64_t res = 0;
+  uint64_t one = 1uLL << 62; // The second-to-top bit is set: use 1u << 14 for uint16_t type; use 1uL<<30 for uint32_t type
+
+  // "one" starts at the highest power of four <= than the argument.
+  while (one > op) {
+    one >>= 2;
+  }
+
+  while (one != 0) {
+    if (op >= res + one) {
+      op = op - (res + one);
+      res = res +  2 * one;
+    }
+    res >>= 1;
+    one >>= 2;
+  }
+
+  /* Do arithmetic rounding to nearest integer */
+  if (op > res) {
+    res++;
+  }
+
+  return res;
+}
+
 //////////////////////////////////////////////////////////////////////////////
 // Timer Function ////////////////////////////////////////////////////////////
 //////////////////////////////////////////////////////////////////////////////
@@ -301,6 +349,8 @@ static ssize_t show_statistics_cb(struct device *dev, struct device_attribute *a
   ssize_t count = 0;
   int len;
   long long stat_mean;
+  long long stat_var;
+  long long stat_stddev;
   int i;
 
   // precalculate values
@@ -309,13 +359,18 @@ static ssize_t show_statistics_cb(struct device *dev, struct device_attribute *a
   } else {
     stat_mean = 0;
   }
+  // StdDev = sqrt((stat_sumsq-(stat_sum^2)/stat_num)/stat_num)
+  stat_var = div_ll(stat_sumsq - div_ll(stat_sum*stat_sum, stat_num), stat_num);
+  stat_stddev = isqrtu64(stat_var);
   // report histogram (we can't use the FPU in a kernel module :-( )
   len = scnprintf(&(buf[count]), PAGE_SIZE-count, "Min: %+lldns\n", stat_min); count += len;
   len = scnprintf(&(buf[count]), PAGE_SIZE-count, "Max: %+lldns\n", stat_max); count += len;
   len = scnprintf(&(buf[count]), PAGE_SIZE-count, "Num: %lld\n", stat_num); count += len;
   len = scnprintf(&(buf[count]), PAGE_SIZE-count, "Sum: %+lldns\n", stat_sum); count += len;
   len = scnprintf(&(buf[count]), PAGE_SIZE-count, "Mean: ~%+lldns\n", stat_mean); count += len;
-  len = scnprintf(&(buf[count]), PAGE_SIZE-count, "SqSum: %lldns\n", stat_sumsq); count += len;
+  len = scnprintf(&(buf[count]), PAGE_SIZE-count, "SqSum: %lldns²\n", stat_sumsq); count += len;
+  len = scnprintf(&(buf[count]), PAGE_SIZE-count, "Var: %lldns²\n", stat_var); count += len;
+  len = scnprintf(&(buf[count]), PAGE_SIZE-count, "StdDev: %lldns\n", stat_stddev); count += len;
   // histogram
   len = scnprintf(&(buf[count]), PAGE_SIZE-count, " <  %+6lldns: %d\n", HIST_BIN_LOW(1), histogram[0]); count += len;
   for (i = 1; i < hist_bin_num; i++) {
